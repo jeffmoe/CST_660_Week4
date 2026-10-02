@@ -34,6 +34,13 @@ Policy (defaults: 15-min windows, 10-min allowed lateness):
 * a window is finalized and written once when the watermark passes its end;
   finalized rows are never rewritten, so late data can't overwrite published aggregates
 
+Why 10 minutes: the generator's tunnel buffering delays events by 2–15 minutes,
+so a 10-minute allowance absorbs normal jitter and most tunnel flushes while
+keeping a 15-minute window's results only about 10 minutes behind real time.
+Waiting for the hours-late stragglers would hold every window open (and its
+state in memory) for hours. Routing them to `late_events` instead keeps
+published counts fast and stable, and no trip is ever lost.
+
 Spark's built-in `withWatermark` drops late rows silently with no side output,
 so the policy is applied explicitly in `foreachBatch`; Spark still assigns the
 windows and does the counting. The run ends with a reconciliation check:
