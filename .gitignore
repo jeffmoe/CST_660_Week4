@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local Spark streaming
+# Third-party Windows Hadoop natives (winutils.exe, hadoop.dll); see README
+hadoop/
+# Pipeline output: landing files, sinks, checkpoint, state
+stream_output/
