@@ -204,10 +204,11 @@ Version numbers below (v70/v71, v121/v122) are from one run and will differ in y
 #### A. Jupyter notebook in VS Code
 
 1. Install the VS Code **Python** and **Jupyter** extensions.
-2. Add notebook support to the project venv. These are only for viewing, so they
-   are not in `requirements.txt`:
+2. Make sure the notebook packages (`ipykernel`, `pandas`) are in the project
+   venv. They're in `requirements.txt`, so this is already done if you followed
+   Setup; otherwise:
    ```
-   .venv\Scripts\python -m pip install ipykernel pandas
+   .venv\Scripts\python -m pip install -r requirements.txt
    ```
 3. In VS Code, open the Command Palette and run **Create: New Jupyter Notebook**.
    Click **Select Kernel** and choose the project's `.venv` interpreter.
