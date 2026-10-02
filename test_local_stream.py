@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from delta_sink import DeltaSink
 from event_stream import generate_trip_events
 from local_stream import (
     US_PER_MINUTE, LatenessPolicy, StateStore, WindowState, land_events,
@@ -76,7 +77,7 @@ class LandEventsTest(unittest.TestCase):
 
 @unittest.skipUnless(importlib.util.find_spec("pyspark"), "pyspark not installed")
 class SparkPipelineTest(unittest.TestCase):
-    """End-to-end on a small replay. Slow (~1 min): starts a local Spark session."""
+    """End-to-end on a small replay into Delta. Slow (~30 s): starts a local Spark session."""
 
     @classmethod
     def setUpClass(cls):
@@ -86,63 +87,82 @@ class SparkPipelineTest(unittest.TestCase):
         cls.out = cls.tmp / "out"
         cls.landed = land_events(generate_trip_events(1, 150, annotate=True),
                                  cls.out / "landing", slice_minutes=60)
+        cls.sink = DeltaSink(cls.out / "delta")
         cls.spark = build_spark()
-        cls.state = run_pipeline(cls.spark, cls.out / "landing", cls.out, POLICY)
+        cls.state = run_pipeline(cls.spark, cls.out / "landing", cls.out, POLICY, cls.sink)
 
     @classmethod
     def tearDownClass(cls):
         cls.spark.stop()
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
-    def _read(self, name):
-        return self.spark.read.parquet(str(self.out / name))
+    def _processor(self, out, app_id="test-writer"):
+        from local_stream import StateStore, make_batch_processor
+        sink = DeltaSink(out / "delta")
+        sink.ensure_tables()
+        store = StateStore(out / "_state")
+        return make_batch_processor(sink, POLICY, store, lambda: app_id), sink, store
+
+    def _batch(self, path):
+        from local_stream import EVENT_SCHEMA
+        return self.spark.read.schema(EVENT_SCHEMA).json(str(path))
 
     def test_every_trip_is_counted_open_or_side_output(self):
         from local_stream import report
-        summary = report(self.spark, self.out, self.landed, self.state)
+        summary = report(self.sink, self.landed, self.state)
         self.assertTrue(summary["reconciles"], summary)
         self.assertGreater(summary["late_side_output_events"], 0)
 
     def test_each_window_is_emitted_exactly_once(self):
-        counts = self._read("zone_window_counts")
-        self.assertEqual(counts.count(), counts.select("window_start", "zone").distinct().count())
+        counts = self.sink.read("zone_window_counts")
+        keys = set(zip(counts["window_start"].to_pylist(), counts["zone"].to_pylist()))
+        self.assertEqual(len(keys), counts.num_rows)
 
     def test_outputs_respect_the_watermark(self):
-        from pyspark.sql import functions as F
-        counts = self._read("zone_window_counts")
-        self.assertEqual(counts.filter(F.col("window_end") > F.col("finalized_at_watermark")).count(), 0)
-        late = self._read("late_events")
-        self.assertEqual(late.filter(F.col("window_end") > F.col("watermark")).count(), 0)
-        self.assertEqual(late.filter(F.col("_delay_class") == "on_time").count(), 0)
+        for row in self.sink.read("zone_window_counts").to_pylist():
+            self.assertLessEqual(row["window_end"], row["finalized_at_watermark"])
+        late = self.sink.read("late_events").to_pylist()
+        for row in late:
+            self.assertLessEqual(row["window_end"], row["watermark"])
+            self.assertNotEqual(row["_delay_class"], "on_time")
+
+    def test_delta_commits_record_the_query_as_writer(self):
+        from delta_sink import checkpoint_query_id
+        app_id = f"zone-windows-{checkpoint_query_id(self.out / '_checkpoint')}"
+        last_batch = self.landed["files"] - 1
+        committed = self.sink.committed_version("zone_window_counts", app_id)
+        self.assertIsNotNone(committed)
+        self.assertLessEqual(committed, last_batch)
 
     def test_replaying_a_batch_is_idempotent(self):
-        from local_stream import EVENT_SCHEMA, StateStore, make_batch_processor
-        out = self.tmp / "replay"
-        store = StateStore(out / "_state")
-        process = make_batch_processor(self.spark, out, POLICY, store)
+        process, sink, store = self._processor(self.tmp / "replay")
         files = sorted((self.out / "landing").glob("*.jsonl"))[:12]
-        batches = [self.spark.read.schema(EVENT_SCHEMA).json(str(f)) for f in files]
+        batches = [self._batch(f) for f in files]
         for batch_id, df in enumerate(batches):
             process(df, batch_id)
-        before = sorted(self.spark.read.parquet(str(out / "zone_window_counts")).collect())
+        before = sink.describe()
+        rows_before = sorted(map(str, sink.read("zone_window_counts").to_pylist()))
         state_before = store.latest()
 
-        process(batches[-1], len(batches) - 1)  # e.g. crash after sink write, before commit
+        last = len(batches) - 1
+        (store.directory / f"{last}.json").unlink()  # crash after Delta commit, before state commit
+        process(batches[last], last)
 
-        self.assertEqual(sorted(self.spark.read.parquet(str(out / "zone_window_counts")).collect()), before)
+        self.assertEqual(sink.describe(), before)  # no new Delta versions
+        self.assertEqual(sorted(map(str, sink.read("zone_window_counts").to_pylist())), rows_before)
         self.assertEqual(store.latest(), state_before)
 
     def test_event_without_event_time_goes_to_side_output(self):
-        from local_stream import EVENT_SCHEMA, StateStore, make_batch_processor
         out = self.tmp / "missing"
         bad = out / "bad.jsonl"
         bad.parent.mkdir(parents=True)
         bad.write_text(json.dumps({"event_id": "x", "event_type": "trip_started",
                                    "pickup_zone": "Z01-DOWNTOWN"}) + "\n")
-        make_batch_processor(self.spark, out, POLICY, StateStore(out / "_state"))(
-            self.spark.read.schema(EVENT_SCHEMA).json(str(bad)), 0)
-        late = self.spark.read.parquet(str(out / "late_events")).collect()
-        self.assertEqual([(r.event_id, r.late_reason) for r in late], [("x", "missing_event_time")])
+        process, sink, _ = self._processor(out)
+        process(self._batch(bad), 0)
+        late = sink.read("late_events").to_pylist()
+        self.assertEqual([(r["event_id"], r["late_reason"], r["event_date"]) for r in late],
+                         [("x", "missing_event_time", None)])
 
 
 if __name__ == "__main__":

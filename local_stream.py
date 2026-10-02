@@ -6,9 +6,12 @@ Pipeline::
         -> landing/*.jsonl                     (one file per processing-time slice)
         -> Spark file source, 1 file/trigger   (one micro-batch per slice)
         -> foreachBatch(process_batch)
-              |- zone_window_counts/           finalized windows, emitted exactly once
-              |- late_events/                  side output: events beyond the watermark
+              |- delta/zone_window_counts      Delta table: finalized windows, written once
+              |- delta/late_events             Delta table: side output beyond the watermark
               '- _state/<batch_id>.json        watermark + open windows (for restarts)
+
+Results land in Delta Lake via delta-rs (see ``delta_sink.py``); each micro-batch
+commit carries a Delta txn(appId=query id, version=batch id), so replays are no-ops.
 
 Why the watermark is explicit instead of ``withWatermark``: Spark's built-in
 watermark silently drops late rows and offers no side output for them, which is
@@ -22,10 +25,10 @@ Lateness policy (same semantics as Spark's watermark):
 * watermark W = max(event_time seen in *previous* micro-batches) - allowed_lateness,
   and it never moves backwards.
 * An event is late iff the tumbling window it falls in ends at or before W, i.e.
-  that window has already been finalized. Late events go to ``late_events/``
+  that window has already been finalized. Late events go to ``late_events``
   with the watermark they missed, never into the counts.
 * After each batch W advances; every open window whose end <= W is finalized and
-  written once to ``zone_window_counts/``. Finalized rows are never rewritten, so
+  written once to ``zone_window_counts``. Finalized rows are never rewritten, so
   late data cannot overwrite published aggregates; corrections must be additive
   from the side output.
 
@@ -43,8 +46,11 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Callable, Iterable, Iterator
 
+import pyarrow.compute as pc
+
+from delta_sink import DeltaSink, checkpoint_query_id, count_by, micros_to_date, total
 from event_stream import generate_trip_events
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -236,13 +242,14 @@ def build_spark():
     return spark
 
 
-def make_batch_processor(spark, out_dir: Path, policy: LatenessPolicy, store: StateStore):
+def make_batch_processor(sink: DeltaSink, policy: LatenessPolicy, store: StateStore,
+                         app_id: Callable[[], str]):
+    """``app_id`` names the writer in Delta txn actions (the query id); it is a
+    callable because Spark only persists the query id once the query has started."""
     from pyspark.sql import functions as F
 
-    counts_dir = out_dir / "zone_window_counts"
-    late_dir = out_dir / "late_events"
-
     def process_batch(batch_df, batch_id: int) -> None:
+        writer = app_id()
         state = store.load_before(batch_id)
         watermark = state.watermark_us
 
@@ -279,42 +286,42 @@ def make_batch_processor(spark, out_dir: Path, policy: LatenessPolicy, store: St
 
         # Side output first: everything the watermark rejects is kept, not dropped.
         if late_rows:
-            (df.filter(F.col("late_reason").isNotNull())
-               .withColumn("window_start", F.timestamp_micros("window_start_us"))
-               .withColumn("window_end", F.timestamp_micros("window_end_us"))
-               .withColumn("watermark", F.expr(f"timestamp_micros({watermark})")
-                           if watermark is not None else F.lit(None).cast("timestamp"))
-               .drop("window_start_us", "window_end_us")
-               .coalesce(1)
-               .write.mode("overwrite").parquet(str(late_dir / f"batch_id={batch_id}")))
+            timestamps = {c for c, t in batch_df.dtypes if t == "timestamp"}
+            late = df.filter(F.col("late_reason").isNotNull()).select(
+                # Timestamps cross into Python as epoch micros: collect() would turn
+                # them into naive local-time datetimes.
+                *[F.unix_micros(c).alias(c) if c in timestamps else F.col(c)
+                  for c in batch_df.columns],
+                "late_reason",
+                F.col("window_start_us").alias("window_start"),
+                F.col("window_end_us").alias("window_end"),
+                F.lit(watermark).cast("long").alias("watermark"),
+                F.lit(batch_id).cast("long").alias("batch_id"),
+                F.to_date("event_time").alias("event_date"),
+            )
+            sink.append("late_events", [r.asDict() for r in late.collect()], writer, batch_id)
 
         finalized = state.apply_batch(on_time_counts, batch_max, policy)
         if finalized:
-            # Built from literals rather than spark.createDataFrame(rows): on Windows
-            # PySpark can't reuse Python workers, so a Python-row DataFrame costs ~2 s
-            # per write to spawn one; this stays in the JVM (~0.05 s).
-            rows = [F.struct(F.lit(start).cast("long").alias("window_start_us"),
-                             F.lit(zone).alias("zone"),
-                             F.lit(n).cast("long").alias("trip_count"))
-                    for start, zone, n in finalized]
-            (spark.range(1).select(F.inline(F.array(*rows)))
-               .select(F.expr("timestamp_micros(window_start_us)").alias("window_start"),
-                       F.expr(f"timestamp_micros(window_start_us + {policy.window_us})")
-                        .alias("window_end"),
-                       "zone", "trip_count",
-                       F.expr(f"timestamp_micros({state.watermark_us})").alias("finalized_at_watermark"))
-               .coalesce(1)
-               .write.mode("overwrite").parquet(str(counts_dir / f"batch_id={batch_id}")))
+            sink.append("zone_window_counts", [
+                {"window_start": start, "window_end": start + policy.window_us, "zone": zone,
+                 "trip_count": n, "finalized_at_watermark": state.watermark_us,
+                 "batch_id": batch_id, "window_date": micros_to_date(start)}
+                for start, zone, n in finalized
+            ], writer, batch_id)
 
         # Commit state last: a crash before this replays the batch from N-1, and
-        # the overwrite-by-batch_id sinks above make that replay idempotent.
+        # the Delta txn check in sink.append makes that replay a no-op.
         store.save(batch_id, state)
 
     return process_batch
 
 
-def run_pipeline(spark, landing_dir: Path, out_dir: Path, policy: LatenessPolicy) -> WindowState:
+def run_pipeline(spark, landing_dir: Path, out_dir: Path, policy: LatenessPolicy,
+                 sink: DeltaSink) -> WindowState:
     store = StateStore(out_dir / "_state")
+    checkpoint = out_dir / "_checkpoint"
+    sink.ensure_tables()
     events = (
         spark.readStream.schema(EVENT_SCHEMA)
         .option("maxFilesPerTrigger", 1)
@@ -323,8 +330,9 @@ def run_pipeline(spark, landing_dir: Path, out_dir: Path, policy: LatenessPolicy
     query = (
         events.writeStream
         .queryName("zone_window_counts")
-        .foreachBatch(make_batch_processor(spark, out_dir, policy, store))
-        .option("checkpointLocation", str(out_dir / "_checkpoint"))
+        .foreachBatch(make_batch_processor(
+            sink, policy, store, lambda: f"zone-windows-{checkpoint_query_id(checkpoint)}"))
+        .option("checkpointLocation", str(checkpoint))
         .trigger(availableNow=True)
         .start()
     )
@@ -332,42 +340,39 @@ def run_pipeline(spark, landing_dir: Path, out_dir: Path, policy: LatenessPolicy
     return store.latest()
 
 
-def report(spark, out_dir: Path, landed: Counter, state: WindowState) -> dict:
-    from pyspark.sql import functions as F
-
-    def read(name):
-        path = out_dir / name
-        return spark.read.parquet(str(path)) if path.exists() else None
-
-    counts, late = read("zone_window_counts"), read("late_events")
-    finalized_trips = counts.agg(F.sum("trip_count")).first()[0] if counts else 0
+def report(sink: DeltaSink, landed: Counter, state: WindowState) -> dict:
+    counts, late = sink.read("zone_window_counts"), sink.read("late_events")
+    late_trips = late.filter(pc.equal(late["event_type"], "trip_started"))
     open_trips = sum(state.open_counts.values())
-    late_trips = late.filter(F.col("event_type") == "trip_started").count() if late else 0
     summary = {
         "landed_events": landed["events"],
         "micro_batches": landed["files"],
         "landed_trips": landed["trip_started"],
-        "finalized_window_trips": finalized_trips or 0,
+        "finalized_window_trips": total(counts, "trip_count"),
         "open_window_trips": open_trips,
-        "late_side_output_trips": late_trips,
-        "late_side_output_events": late.count() if late else 0,
+        "late_side_output_trips": late_trips.num_rows,
+        "late_side_output_events": late.num_rows,
         "watermark": None if state.watermark_us is None else
             (datetime(1970, 1, 1, tzinfo=timezone.utc)
              + timedelta(microseconds=state.watermark_us)).isoformat(),
     }
-    summary["reconciles"] = (summary["finalized_window_trips"] + open_trips + late_trips
-                             == summary["landed_trips"])
+    summary["reconciles"] = (summary["finalized_window_trips"] + open_trips
+                             + late_trips.num_rows == summary["landed_trips"])
 
     print("\n== Pipeline summary ==")
     for key, value in summary.items():
         print(f"{key:26}: {value:,}" if isinstance(value, int) and not isinstance(value, bool)
               else f"{key:26}: {value}")
-    if late is not None:
-        print("\nLate side output by reason / injected delay class:")
-        late.groupBy("late_reason", "_delay_class").count().orderBy("late_reason", "_delay_class").show()
-        print("Late trips by pickup zone:")
-        (late.filter(F.col("event_type") == "trip_started")
-             .groupBy("pickup_zone").count().orderBy(F.desc("count")).show())
+    print("\nLate side output by reason / injected delay class:")
+    for reason, delay_class, n in count_by(late, ["late_reason", "_delay_class"]):
+        print(f"  {reason:20} {delay_class or '-':12} {n:>6,}")
+    print("Late trips by pickup zone:")
+    for zone, n in count_by(late_trips, ["pickup_zone"]):
+        print(f"  {zone:20} {n:>6,}")
+    print("\nDelta tables:")
+    for name, info in sink.describe().items():
+        print(f"  {name:20} version {info['version']:>4}  files {info['files']:>4}  "
+              f"rows {info['rows']:>6,}  ops {info['operations']}")
     return summary
 
 
@@ -382,7 +387,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--allowed-lateness-minutes", type=int, default=10)
     parser.add_argument("--out", type=Path, default=PROJECT_DIR / "stream_output")
     parser.add_argument("--reset", action="store_true",
-                        help="delete --out (landing, sinks, checkpoint) before running")
+                        help="delete --out (landing, Delta tables, checkpoint) before running")
+    parser.add_argument("--skip-compact", action="store_true",
+                        help="don't OPTIMIZE (bin-pack) the Delta tables after the run")
     args = parser.parse_args(argv)
 
     policy = LatenessPolicy(args.window_minutes, args.allowed_lateness_minutes)
@@ -401,12 +408,16 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Policy: {policy.window_minutes}-min tumbling windows, "
           f"{policy.allowed_lateness_minutes}-min allowed lateness")
 
+    sink = DeltaSink(args.out / "delta")
     spark = build_spark()
     try:
-        state = run_pipeline(spark, landing_dir, args.out, policy)
-        summary = report(spark, args.out, landed, state)
+        state = run_pipeline(spark, landing_dir, args.out, policy, sink)
     finally:
         spark.stop()
+    if not args.skip_compact:
+        for name, m in sink.compact().items():
+            print(f"OPTIMIZE {name}: {m['numFilesRemoved']} files -> {m['numFilesAdded']}")
+    summary = report(sink, landed, state)
     return 0 if summary["reconciles"] else 1
 
 
