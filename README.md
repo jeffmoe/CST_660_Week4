@@ -187,6 +187,190 @@ DeltaTable(path, version=119).to_pyarrow_table()
 old = DeltaTable(path); old.load_as_version("2026-10-02T14:48:00Z"); old.version()
 ```
 
+### Viewing the Delta tables (no CLI)
+
+Two ways to look at the tables before and after the schema change and the bad
+correction: a Jupyter notebook in VS Code, or the raw files on disk.
+
+**First, produce something to look at.** Run steps 1 and 2 above, but run the
+demo with `--no-restore` so the bad correction is still the current version:
+
+```
+.venv\Scripts\python delta_demo.py --no-restore
+```
+
+Version numbers below (v70/v71, v121/v122) are from one run and will differ in yours.
+
+#### A. Jupyter notebook in VS Code
+
+1. Install the VS Code **Python** and **Jupyter** extensions.
+2. Add notebook support to the project venv. These are only for viewing, so they
+   are not in `requirements.txt`:
+   ```
+   .venv\Scripts\python -m pip install ipykernel pandas
+   ```
+3. In VS Code, open the Command Palette and run **Create: New Jupyter Notebook**.
+   Click **Select Kernel** and choose the project's `.venv` interpreter.
+4. Paste each block below into its own cell and run the cells in order. Set
+   `ROOT` to the full path of your `stream_output\delta` folder, because the
+   notebook's working directory is wherever you save it.
+
+**Cell 1: commit history.** Every commit is a version. The two `tidewater.*`
+columns tag the schema-evolution commit and the bad correction.
+
+```python
+import pandas as pd
+from deltalake import DeltaTable
+
+ROOT = r"C:\path\to\CST_660_Week4\stream_output\delta"
+counts_path = rf"{ROOT}\zone_window_counts"
+
+history = pd.DataFrame(DeltaTable(counts_path).history())
+history["timestamp"] = pd.to_datetime(history["timestamp"], unit="ms", utc=True)
+history[["version", "timestamp", "operation", "tidewater.schemaEvolution", "tidewater.job"]]
+```
+
+**Cell 2: find the interesting versions.** These come from the history, so you
+never type a version number by hand.
+
+```python
+evo = int(history.loc[history["tidewater.schemaEvolution"].notna(), "version"].min())
+bad = int(history.loc[history["tidewater.job"] == "late-data-correction", "version"].max())
+day = history.loc[history["version"] == bad, "operationParameters"].iloc[0]["predicate"].split("'")[1]
+print(f"schema evolved at v{evo}; bad correction at v{bad} on {day}")
+```
+
+**Cell 3: schema before and after the new column.** The right-hand column has
+one more row, `avg_surge_multiplier`.
+
+```python
+def columns(version):
+    return pd.Series([f.name for f in DeltaTable(counts_path, version=version).schema().fields])
+
+pd.DataFrame({f"v{evo - 1} (before)": columns(evo - 1), f"v{evo} (after)": columns(evo)})
+```
+
+**Cell 4: rows before and after the schema change.** The first table has no
+surge column. The second has it, empty for day 3 and filled for the first day-4
+window. The summary shows the whole current table: no surge values before
+2026-10-01, and every row has one from then on.
+
+```python
+def snapshot(path, version=None):
+    df = DeltaTable(path, version=version).to_pyarrow_table().to_pandas()
+    return df.sort_values(["window_start", "zone"]).reset_index(drop=True)
+
+display(snapshot(counts_path, evo - 1).tail(5))
+display(snapshot(counts_path, evo).tail(5))
+current = snapshot(counts_path)
+current.groupby(current["window_date"].astype(str))["avg_surge_multiplier"].agg(rows="size", with_surge="count")
+```
+
+**Cell 5: time travel around the bad correction.** These are the corrupted day
+before the correction (`bad - 1`) and after it (`bad`), plus the trips lost per
+zone. In the sample run the day had 291 trips before and 9 after.
+
+```python
+def day_rows(version):
+    df = snapshot(counts_path, version)
+    return df[df["window_date"].astype(str) == day]
+
+before, after = day_rows(bad - 1), day_rows(bad)
+display(before)
+display(after)
+compare = pd.DataFrame({"before": before.groupby("zone")["trip_count"].sum(),
+                        "after": after.groupby("zone")["trip_count"].sum()}).fillna(0).astype(int)
+compare["lost"] = compare["before"] - compare["after"]
+compare.loc["TOTAL"] = compare.sum()
+compare
+```
+
+**Cell 6: time travel by timestamp.** Loading the table "as of" the commit time
+of the last good version resolves to that same version.
+
+```python
+commit_time = history.loc[history["version"] == bad - 1, "timestamp"].iloc[0]
+as_of = DeltaTable(counts_path)
+as_of.load_as_version(commit_time.to_pydatetime())
+print(f"as of {commit_time} -> v{as_of.version()} (expected v{bad - 1})")
+```
+
+**Cell 7 (optional): the late-events side output.** `surge_multiplier` is empty
+before day 4 and filled from day 4 on.
+
+```python
+late = DeltaTable(rf"{ROOT}\late_events").to_pyarrow_table().to_pandas()
+late.groupby(late["event_date"].astype(str))["surge_multiplier"].agg(rows="size", with_surge="count")
+```
+
+To scroll, sort, and filter a whole snapshot in a grid, open the **Jupyter:
+Variables** panel and click **Show in Data Viewer** next to a DataFrame such as
+`before` or `after`.
+
+**When you're done**, undo the bad correction in a new cell. The restore is a
+new commit, so the history keeps the bad version:
+
+```python
+DeltaTable(counts_path).restore(bad - 1)
+```
+
+#### B. Browse the files directly
+
+A Delta table is just a folder. Open `stream_output\delta\zone_window_counts`
+in VS Code or File Explorer:
+
+```
+zone_window_counts\
+  window_date=2026-09-28\ ...      partition folders of Parquet data files
+  window_date=2026-09-30\
+    part-...-c000.snappy.parquet   files written by the stream / the bad correction
+    part-...-c000.zstd.parquet     the compacted file written by OPTIMIZE
+  _delta_log\
+    00000000000000000000.json      version 0 (create table)
+    00000000000000000071.json      version 71 ... one JSON file per commit
+    00000000000000000119.checkpoint.parquet   log snapshot (OPTIMIZE step, every 100 commits)
+    _last_checkpoint
+```
+
+Each `_delta_log\NNN.json` file is commit (version) NNN, with one JSON action
+per line:
+
+| Action | What it tells you |
+|---|---|
+| `commitInfo` | operation (WRITE / OPTIMIZE / RESTORE), mode, `predicate`, and the `tidewater.schemaEvolution` / `tidewater.job` tags |
+| `metaData` | the table schema (`schemaString`). Only in version 0 and in the schema-evolution commit |
+| `add` / `remove` | Parquet files that joined or left the table in this version |
+| `txn` | the streaming query id and micro-batch number (exactly-once bookkeeping) |
+
+Walkthrough:
+
+1. **Find the schema change.** In VS Code, right-click `_delta_log` and choose
+   **Find in Folder...**, then search for `schemaEvolution`. The matching commit
+   (e.g. `...0071.json`) has:
+   - `commitInfo` with `"tidewater.schemaEvolution": "added avg_surge_multiplier at batch 72"`
+   - a `metaData` line whose `schemaString` now includes `avg_surge_multiplier`.
+     Compare it with the `metaData` in `...0000.json`, which doesn't have it.
+   - an `add` for the first `window_date=2026-10-01` file
+2. **Find the bad correction.** Search the folder for `late-data-correction`.
+   That commit (e.g. `...0122.json`) has:
+   - `commitInfo` with `"mode": "Overwrite"` and `"predicate": "window_date = '2026-09-30'::date"`
+   - a `remove` for the day's compacted `...zstd.parquet` file. That file held
+     the good counts.
+   - an `add` for a new `...snappy.parquet` file holding only the 9 late trips
+3. **Why time travel works.** The removed file is still in the partition
+   folder. Delta only deletes files on VACUUM, which this project never runs.
+   A version is simply every `add` up to that commit minus every `remove` up to
+   that commit. So version 121 still points at the good file, and version 122
+   points at the bad one.
+4. **Look inside the Parquet files.** Install a Parquet viewer extension (search
+   the Extensions view for "Parquet"), then open both files named in step 2
+   from `window_date=2026-09-30\`. The `remove`d `.zstd.parquet` file shows the
+   full day as it was before the correction. The `add`ed `.snappy.parquet` file
+   shows the 9 rows that replaced it.
+
+Look, but don't edit or delete files here. The log is the source of truth, and
+hand edits corrupt the table. Use `restore` (above) to roll back.
+
 ### 4. Automated tests
 
 ```
