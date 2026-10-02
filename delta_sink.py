@@ -12,6 +12,11 @@ Exactly-once per micro-batch: every append commits a Delta ``txn`` action
 writing, the sink checks the table's recorded version for that appId and skips
 batches it has already committed, so a replayed foreachBatch is a no-op. This is
 the same mechanism Spark's own Delta streaming sink uses.
+
+Schema evolution: tables are created with the schema-v1 columns only. When a
+batch first carries a value for a schema-v2 column (``EVOLVING_COLUMNS``), that
+same commit merges the column into the table schema and is tagged
+``tidewater.schemaEvolution`` in the Delta history (see ``delta_demo.py``).
 """
 
 from __future__ import annotations
@@ -32,6 +37,7 @@ ZONE_WINDOW_COUNTS_SCHEMA = pa.schema([
     pa.field("window_end", TS, nullable=False),
     pa.field("zone", pa.string(), nullable=False),
     pa.field("trip_count", pa.int64(), nullable=False),
+    pa.field("avg_surge_multiplier", pa.float64()),  # schema v2 (day 4+)
     pa.field("finalized_at_watermark", TS, nullable=False),
     pa.field("batch_id", pa.int64(), nullable=False),
     pa.field("window_date", pa.date32(), nullable=False),
@@ -51,6 +57,13 @@ LATE_EVENTS_SCHEMA = pa.schema([
     ("batch_id", pa.int64()),
     ("event_date", pa.date32()),
 ])
+
+# Columns that only exist once schema v2 (surge pricing, simulated day 4) is live.
+# Tables are created without them; the first append that carries a non-null value
+# adds the column via Delta schema evolution (schema_mode="merge"). Older files are
+# untouched and read the new column as null.
+EVOLVING_COLUMNS = {"surge_multiplier", "avg_surge_multiplier"}
+SCHEMA_EVOLUTION_KEY = "tidewater.schemaEvolution"  # commitInfo tag on evolving commits
 
 TABLES = {
     "zone_window_counts": (ZONE_WINDOW_COUNTS_SCHEMA, ["window_date"],
@@ -79,25 +92,42 @@ class DeltaSink:
     def ensure_tables(self) -> None:
         for name, (schema, partition_by, description) in TABLES.items():
             if not DeltaTable.is_deltatable(self.path(name)):
-                DeltaTable.create(self.path(name), schema, partition_by=partition_by,
+                initial = pa.schema([f for f in schema if f.name not in EVOLVING_COLUMNS])
+                DeltaTable.create(self.path(name), initial, partition_by=partition_by,
                                   name=name, description=description)
 
     def committed_version(self, name: str, app_id: str) -> int | None:
         return DeltaTable(self.path(name)).transaction_version(app_id)
 
     def append(self, name: str, rows: list[dict], app_id: str, batch_id: int) -> bool:
-        """Append rows as micro-batch ``batch_id``; returns False if already committed."""
+        """Append rows as micro-batch ``batch_id``; returns False if already committed.
+
+        If the rows carry a value for a column the table doesn't have yet, the same
+        atomic commit evolves the schema and is tagged in the Delta history."""
         dt = DeltaTable(self.path(name))
         done = dt.transaction_version(app_id)
         if done is not None and done >= batch_id:
             return False
-        schema = TABLES[name][0]
+        existing = {f.name for f in dt.schema().fields}
+        added = [f.name for f in TABLES[name][0] if f.name not in existing
+                 and any(r.get(f.name) is not None for r in rows)]
+        schema = pa.schema([f for f in TABLES[name][0] if f.name in existing or f.name in added])
+        metadata = {SCHEMA_EVOLUTION_KEY: f"added {', '.join(added)} at batch {batch_id}"} if added else None
         write_deltalake(
             dt, pa.Table.from_pylist(rows, schema=schema), mode="append",
+            schema_mode="merge" if added else None,
             commit_properties=CommitProperties(
+                custom_metadata=metadata,
                 app_transactions=[Transaction(app_id=app_id, version=batch_id)]),
         )
         return True
+
+    def schema_changes(self, name: str) -> list[dict]:
+        """Commits that evolved the schema, oldest first: [{version, timestamp, change}]."""
+        return sorted(
+            ({"version": h["version"], "timestamp": h["timestamp"], "change": h[SCHEMA_EVOLUTION_KEY]}
+             for h in DeltaTable(self.path(name)).history() if SCHEMA_EVOLUTION_KEY in h),
+            key=lambda c: c["version"])
 
     def read(self, name: str, version: int | None = None) -> pa.Table:
         return DeltaTable(self.path(name), version=version).to_pyarrow_table()

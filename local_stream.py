@@ -96,23 +96,31 @@ class WindowState:
     max_event_time_us: int | None = None
     watermark_us: int | None = None  # None until the first batch: nothing is late yet
     open_counts: dict[tuple[int, str], int] = field(default_factory=dict)  # (window_start, zone)
+    # (window_start, zone) -> [sum, n] of surge_multiplier; only schema-v2 trips have one
+    open_surge: dict[tuple[int, str], list] = field(default_factory=dict)
 
     def is_late(self, window_end_us: int) -> bool:
         return self.watermark_us is not None and window_end_us <= self.watermark_us
 
     def apply_batch(
         self,
-        on_time_counts: Iterable[tuple[int, str, int]],
+        on_time_counts: Iterable[tuple],
         batch_max_event_time_us: int | None,
         policy: LatenessPolicy,
-    ) -> list[tuple[int, str, int]]:
+    ) -> list[tuple[int, str, int, float | None]]:
         """Merge one batch's on-time counts, advance the watermark, and return the
-        (window_start_us, zone, count) rows that are now final."""
-        for window_start, zone, n in on_time_counts:
+        (window_start_us, zone, count, avg_surge_multiplier) rows that are now final.
+
+        Each input row is (window_start_us, zone, count[, surge_sum, surge_n])."""
+        for window_start, zone, n, *surge in on_time_counts:
             if self.is_late(window_start + policy.window_us):
                 raise ValueError(f"late window {window_start}/{zone} passed as on-time")
             key = (window_start, zone)
             self.open_counts[key] = self.open_counts.get(key, 0) + n
+            if surge and surge[1]:
+                acc = self.open_surge.setdefault(key, [0.0, 0])
+                acc[0] += surge[0]
+                acc[1] += surge[1]
 
         if batch_max_event_time_us is not None:
             if self.max_event_time_us is None or batch_max_event_time_us > self.max_event_time_us:
@@ -121,12 +129,11 @@ class WindowState:
             if self.watermark_us is None or candidate > self.watermark_us:
                 self.watermark_us = candidate
 
-        finalized = sorted(
-            (start, zone, n) for (start, zone), n in self.open_counts.items()
-            if self.is_late(start + policy.window_us)
-        )
-        for start, zone, _ in finalized:
-            del self.open_counts[(start, zone)]
+        finalized = []
+        for key in sorted(k for k in self.open_counts if self.is_late(k[0] + policy.window_us)):
+            surge_sum, surge_n = self.open_surge.pop(key, (0.0, 0))
+            avg_surge = round(surge_sum / surge_n, 4) if surge_n else None
+            finalized.append((*key, self.open_counts.pop(key), avg_surge))
         return finalized
 
     def to_json(self) -> str:
@@ -134,13 +141,15 @@ class WindowState:
             "max_event_time_us": self.max_event_time_us,
             "watermark_us": self.watermark_us,
             "open_counts": [[s, z, n] for (s, z), n in sorted(self.open_counts.items())],
+            "open_surge": [[s, z, t, n] for (s, z), (t, n) in sorted(self.open_surge.items())],
         })
 
     @classmethod
     def from_json(cls, text: str) -> "WindowState":
         raw = json.loads(text)
         return cls(raw["max_event_time_us"], raw["watermark_us"],
-                   {(s, z): n for s, z, n in raw["open_counts"]})
+                   {(s, z): n for s, z, n in raw["open_counts"]},
+                   {(s, z): [t, n] for s, z, t, n in raw.get("open_surge", [])})
 
 
 class StateStore:
@@ -274,13 +283,15 @@ def make_batch_processor(sink: DeltaSink, policy: LatenessPolicy, store: StateSt
         groups = (
             df.groupBy("window_start_us", F.col("pickup_zone").alias("zone"),
                        "event_type", "late_reason")
-            .agg(F.count("*").alias("n"), F.max(event_us).alias("max_us"))
+            .agg(F.count("*").alias("n"), F.max(event_us).alias("max_us"),
+                 F.sum("surge_multiplier").alias("surge_sum"),
+                 F.count("surge_multiplier").alias("surge_n"))
             .collect()
         )
         late_rows = sum(g.n for g in groups if g.late_reason is not None)
         batch_max = max((g.max_us for g in groups if g.max_us is not None), default=None)
         on_time_counts = [
-            (g.window_start_us, g.zone, g.n) for g in groups
+            (g.window_start_us, g.zone, g.n, g.surge_sum or 0.0, g.surge_n) for g in groups
             if g.late_reason is None and g.event_type == "trip_started"
         ]
 
@@ -305,9 +316,10 @@ def make_batch_processor(sink: DeltaSink, policy: LatenessPolicy, store: StateSt
         if finalized:
             sink.append("zone_window_counts", [
                 {"window_start": start, "window_end": start + policy.window_us, "zone": zone,
-                 "trip_count": n, "finalized_at_watermark": state.watermark_us,
+                 "trip_count": n, "avg_surge_multiplier": avg_surge,
+                 "finalized_at_watermark": state.watermark_us,
                  "batch_id": batch_id, "window_date": micros_to_date(start)}
-                for start, zone, n in finalized
+                for start, zone, n, avg_surge in finalized
             ], writer, batch_id)
 
         # Commit state last: a crash before this replays the batch from N-1, and

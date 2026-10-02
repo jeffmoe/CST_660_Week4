@@ -3,7 +3,10 @@ import json
 import shutil
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
+
+from deltalake import DeltaTable
 
 from delta_sink import DeltaSink
 from event_stream import generate_trip_events
@@ -29,7 +32,7 @@ class WindowStateTest(unittest.TestCase):
     def test_window_finalizes_once_when_watermark_passes_its_end(self):
         state = WindowState()
         self.assertEqual(state.apply_batch([(0, "Z1", 3)], 20 * M, POLICY), [])  # W=10 < end 15
-        self.assertEqual(state.apply_batch([(0, "Z1", 2)], 25 * M, POLICY), [(0, "Z1", 5)])  # W=15
+        self.assertEqual(state.apply_batch([(0, "Z1", 2)], 25 * M, POLICY), [(0, "Z1", 5, None)])  # W=15
         self.assertEqual(state.open_counts, {})
         self.assertEqual(state.apply_batch([], 40 * M, POLICY), [])
 
@@ -41,9 +44,16 @@ class WindowStateTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             state.apply_batch([(30 * M, "Z1", 1)], 60 * M, POLICY)
 
+    def test_surge_is_averaged_across_batches(self):
+        state = WindowState()
+        state.apply_batch([(0, "Z1", 2, 3.0, 2)], 20 * M, POLICY)       # two v2 trips at 1.5
+        done = state.apply_batch([(0, "Z1", 2, 2.0, 1)], 25 * M, POLICY)  # one v2 + one v1 trip
+        self.assertEqual(done, [(0, "Z1", 4, round(5.0 / 3, 4))])
+        self.assertEqual(state.open_surge, {})
+
     def test_json_round_trip(self):
         state = WindowState()
-        state.apply_batch([(0, "Z1", 3), (15 * M, "Z2", 1)], 20 * M, POLICY)
+        state.apply_batch([(0, "Z1", 3), (15 * M, "Z2", 1, 1.25, 1)], 20 * M, POLICY)
         self.assertEqual(WindowState.from_json(state.to_json()), state)
 
 
@@ -85,8 +95,9 @@ class SparkPipelineTest(unittest.TestCase):
 
         cls.tmp = Path(tempfile.mkdtemp())
         cls.out = cls.tmp / "out"
-        cls.landed = land_events(generate_trip_events(1, 150, annotate=True),
-                                 cls.out / "landing", slice_minutes=60)
+        # 4 days so the stream crosses the day-4 schema change (surge_multiplier)
+        cls.landed = land_events(generate_trip_events(4, 60, annotate=True),
+                                 cls.out / "landing", slice_minutes=120)
         cls.sink = DeltaSink(cls.out / "delta")
         cls.spark = build_spark()
         cls.state = run_pipeline(cls.spark, cls.out / "landing", cls.out, POLICY, cls.sink)
@@ -125,6 +136,19 @@ class SparkPipelineTest(unittest.TestCase):
         for row in late:
             self.assertLessEqual(row["window_end"], row["watermark"])
             self.assertNotEqual(row["_delay_class"], "on_time")
+
+    def test_counts_table_evolves_when_surge_arrives(self):
+        changes = self.sink.schema_changes("zone_window_counts")
+        self.assertEqual(len(changes), 1)
+        self.assertIn("avg_surge_multiplier", changes[0]["change"])
+        before = DeltaTable(self.sink.path("zone_window_counts"), version=changes[0]["version"] - 1)
+        self.assertNotIn("avg_surge_multiplier", [f.name for f in before.schema().fields])
+        day4 = date(2026, 10, 1)
+        for row in self.sink.read("zone_window_counts").to_pylist():
+            if row["window_date"] < day4:
+                self.assertIsNone(row["avg_surge_multiplier"])
+            else:
+                self.assertGreaterEqual(row["avg_surge_multiplier"], 1.0)
 
     def test_delta_commits_record_the_query_as_writer(self):
         from delta_sink import checkpoint_query_id

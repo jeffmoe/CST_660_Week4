@@ -12,11 +12,16 @@ from local_stream import EVENT_SCHEMA, US_PER_MINUTE
 DAY0 = 1_790_553_600_000_000  # 2026-09-28T00:00:00Z in epoch micros
 
 
-def window_row(minute: int, zone: str, n: int, batch_id: int) -> dict:
+def window_row(minute: int, zone: str, n: int, batch_id: int, surge: float | None = None) -> dict:
     start = DAY0 + minute * US_PER_MINUTE
     return {"window_start": start, "window_end": start + 15 * US_PER_MINUTE, "zone": zone,
-            "trip_count": n, "finalized_at_watermark": start + 20 * US_PER_MINUTE,
+            "trip_count": n, "avg_surge_multiplier": surge,
+            "finalized_at_watermark": start + 20 * US_PER_MINUTE,
             "batch_id": batch_id, "window_date": micros_to_date(start)}
+
+
+def columns(dt: DeltaTable) -> list[str]:
+    return [f.name for f in dt.schema().fields]
 
 
 class DeltaSinkTest(unittest.TestCase):
@@ -72,6 +77,32 @@ class DeltaSinkTest(unittest.TestCase):
                                                  window_row(15, "Z1", 1, 0)], "q1", 0)
         self.assertEqual(count_by(self.sink.read("zone_window_counts"), ["zone"]),
                          [("Z1", 2), ("Z2", 1)])
+
+    def test_tables_start_without_schema_v2_columns(self):
+        self.assertNotIn("avg_surge_multiplier", columns(DeltaTable(self.sink.path("zone_window_counts"))))
+        self.assertNotIn("surge_multiplier", columns(DeltaTable(self.sink.path("late_events"))))
+
+    def test_all_null_new_column_does_not_evolve_schema(self):
+        self.sink.append("zone_window_counts", [window_row(0, "Z1", 3, 0)], "q1", 0)
+        self.assertNotIn("avg_surge_multiplier", columns(DeltaTable(self.sink.path("zone_window_counts"))))
+        self.assertEqual(self.sink.schema_changes("zone_window_counts"), [])
+
+    def test_first_value_evolves_schema_once(self):
+        path = self.sink.path("zone_window_counts")
+        self.sink.append("zone_window_counts", [window_row(0, "Z1", 3, 0)], "q1", 0)
+        self.sink.append("zone_window_counts", [window_row(15, "Z1", 1, 1, surge=1.5)], "q1", 1)
+        self.sink.append("zone_window_counts", [window_row(30, "Z1", 2, 2)], "q1", 2)
+
+        changes = self.sink.schema_changes("zone_window_counts")
+        self.assertEqual([(c["version"], c["change"]) for c in changes],
+                         [(2, "added avg_surge_multiplier at batch 1")])
+        self.assertNotIn("avg_surge_multiplier", columns(DeltaTable(path, version=1)))
+        self.assertIn("avg_surge_multiplier", columns(DeltaTable(path, version=2)))
+        surge = sorted(self.sink.read("zone_window_counts").to_pylist(), key=lambda r: r["window_start"])
+        self.assertEqual([r["avg_surge_multiplier"] for r in surge], [None, 1.5, None])
+        # the evolving commit is still exactly-once
+        self.assertFalse(self.sink.append("zone_window_counts",
+                                          [window_row(15, "Z1", 1, 1, surge=1.5)], "q1", 1))
 
     def test_micros_to_date_is_utc(self):
         self.assertEqual(micros_to_date(DAY0), date(2026, 9, 28))
